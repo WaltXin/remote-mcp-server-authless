@@ -55,6 +55,87 @@ export class MyMCP extends McpAgent {
 				return { content: [{ type: "text", text: String(result) }] };
 			}
 		);
+
+		// Add todo tool that calls external API
+		this.server.tool(
+			"add_todo",
+			{
+				title: z.string().describe("The title of the todo item"),
+				note: z.string().optional().describe("Optional note for the todo item"),
+			},
+			async ({ title, note }) => {
+				try {
+					// Generate current date and time
+					const now = new Date();
+					
+					// Format date as YYYY/MM/DD
+					const date = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')}`;
+					
+					// Format start time as HH:MM AM/PM
+					const startTime = now.toLocaleTimeString('en-US', {
+						hour: '2-digit',
+						minute: '2-digit',
+						hour12: true
+					});
+					
+					// Calculate end time (start time + 15 minutes)
+					const endDate = new Date(now.getTime() + 15 * 60 * 1000);
+					const endTime = endDate.toLocaleTimeString('en-US', {
+						hour: '2-digit',
+						minute: '2-digit',
+						hour12: true
+					});
+
+					// Prepare request body
+					const requestBody = {
+						title,
+						note: note || "",
+						date,
+						startTime,
+						endTime
+					};
+
+					// Call the external API
+					const response = await fetch("https://2s627cz5fiowa22mehsoxahboq0pibpv.lambda-url.us-west-2.on.aws/tasks", {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(requestBody),
+					});
+
+					if (!response.ok) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Error: Failed to create todo. Status: ${response.status}`,
+								},
+							],
+						};
+					}
+
+					const result = await response.text();
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Todo created successfully! Response: ${result}`,
+							},
+						],
+					};
+				} catch (error) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Error: Failed to create todo - ${error instanceof Error ? error.message : 'Unknown error'}`,
+							},
+						],
+					};
+				}
+			}
+		);
 	}
 }
 
