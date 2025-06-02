@@ -1,11 +1,12 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import CognitoHandler from "./cognito-handler";
 
 // Define our MCP agent with tools
 export class MyMCP extends McpAgent {
 	server = new McpServer({
-		name: "Authless Calculator",
+		name: "Todo MCP Server with Auth",
 		version: "1.0.0",
 	});
 
@@ -139,15 +140,87 @@ export class MyMCP extends McpAgent {
 	}
 }
 
+// OAuth middleware to check for bearer token
+async function requireAuth(request: Request, env: Env): Promise<Response | null> {
+	const authHeader = request.headers.get("Authorization");
+	
+	if (!authHeader || !authHeader.startsWith("Bearer ")) {
+		return new Response(
+			JSON.stringify({
+				error: "unauthorized",
+				message: "Bearer token required for MCP access"
+			}),
+			{
+				status: 401,
+				headers: {
+					"Content-Type": "application/json",
+					"WWW-Authenticate": "Bearer"
+				}
+			}
+		);
+	}
+
+	// Here you would typically validate the token
+	// For now, we'll just check if it exists
+	const token = authHeader.substring(7);
+	if (!token) {
+		return new Response(
+			JSON.stringify({
+				error: "invalid_token",
+				message: "Invalid bearer token"
+			}),
+			{
+				status: 401,
+				headers: { "Content-Type": "application/json" }
+			}
+		);
+	}
+
+	return null; // Authentication passed
+}
+
 export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
+		// OAuth Discovery endpoint - required for MCP clients to discover OAuth settings
+		if (url.pathname === "/.well-known/oauth-authorization-server") {
+			return new Response(
+				JSON.stringify({
+					issuer: url.origin,
+					authorization_endpoint: `${url.origin}/authorize`,
+					token_endpoint: `${url.origin}/token`,
+					registration_endpoint: `${url.origin}/register`,
+					scopes_supported: ["openid", "profile", "email"],
+					response_types_supported: ["code"],
+					response_modes_supported: ["query"],
+					grant_types_supported: ["authorization_code", "refresh_token"],
+					token_endpoint_auth_methods_supported: ["none"],
+					code_challenge_methods_supported: ["S256"],
+				}),
+				{
+					headers: { "Content-Type": "application/json" },
+				}
+			);
+		}
+
+		// Handle OAuth authorization endpoint
+		if (url.pathname === "/authorize" || url.pathname === "/callback" || url.pathname === "/token" || url.pathname === "/register") {
+			return CognitoHandler.fetch(request, env);
+		}
+
+		// Protect MCP endpoints with authentication
 		if (url.pathname === "/sse" || url.pathname === "/sse/message") {
+			const authError = await requireAuth(request, env);
+			if (authError) return authError;
+			
 			return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
 		}
 
 		if (url.pathname === "/mcp") {
+			const authError = await requireAuth(request, env);
+			if (authError) return authError;
+			
 			return MyMCP.serve("/mcp").fetch(request, env, ctx);
 		}
 
