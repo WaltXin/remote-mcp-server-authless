@@ -1,13 +1,13 @@
-interface CognitoUserInfo {
+interface GoogleUserInfo {
 	sub: string;
 	email?: string;
-	email_verified?: boolean;
 	name?: string;
 	given_name?: string;
 	family_name?: string;
+	picture?: string;
 }
 
-interface CognitoTokenResponse {
+interface GoogleTokenResponse {
 	access_token: string;
 	token_type: string;
 	expires_in: number;
@@ -23,10 +23,33 @@ interface ClientRegistration {
 	response_types?: string[];
 }
 
+interface MCPTokenData {
+	cognitoIdentityId: string;
+	googleUserId: string;
+	email: string;
+	name: string;
+	timestamp: number;
+}
+
+interface CognitoIdentityResponse {
+	IdentityId: string;
+}
+
+// Function signature for createMCPAuthCode
+interface CreateMCPAuthCodeInput {
+	cognitoIdentityId: string;
+	googleUserId: string;
+	email: string;
+	name: string;
+}
+
 // Simple in-memory store for registered clients (in production, use a database)
 const registeredClients = new Map<string, any>();
 
-export default {
+// Simple in-memory token store (not suitable for production)
+const tokenStore = new Map<string, MCPTokenData>();
+
+export const cognitoHandler = {
 	async fetch(request: Request, env: any): Promise<Response> {
 		const url = new URL(request.url);
 
@@ -40,7 +63,7 @@ export default {
 			return this.handleToken(request, env);
 		}
 
-		// Handle OAuth callback from Cognito
+		// Handle OAuth callback from Google
 		if (url.pathname === "/callback") {
 			return this.handleCallback(request, env);
 		}
@@ -51,7 +74,7 @@ export default {
 		}
 
 		// Default response for the root path
-		return new Response("AWS Cognito OAuth Handler", { status: 200 });
+		return new Response("Direct Google OAuth Handler", { status: 200 });
 	},
 
 	async handleRegister(request: Request, env: any): Promise<Response> {
@@ -109,8 +132,6 @@ export default {
 			const grantType = params.get("grant_type");
 			const code = params.get("code");
 			const clientId = params.get("client_id");
-			const codeVerifier = params.get("code_verifier");
-			const redirectUri = params.get("redirect_uri");
 
 			if (grantType !== "authorization_code" || !code || !clientId) {
 				return new Response(
@@ -119,19 +140,10 @@ export default {
 				);
 			}
 
-			// Verify client is registered
-			const client = registeredClients.get(clientId);
-			if (!client) {
-				return new Response(
-					JSON.stringify({ error: "invalid_client" }),
-					{ status: 401, headers: { "Content-Type": "application/json" } }
-				);
-			}
-
-			// Decode the auth code to get user info (this is our simple implementation)
-			let userInfo;
+			// Decode the auth code to get token data
+			let tokenData: MCPTokenData;
 			try {
-				userInfo = JSON.parse(atob(code));
+				tokenData = JSON.parse(atob(code));
 			} catch (error) {
 				return new Response(
 					JSON.stringify({ error: "invalid_grant" }),
@@ -139,17 +151,11 @@ export default {
 				);
 			}
 
-			// Generate access token (in production, use proper JWT)
+			// Generate MCP access token
 			const accessToken = `mcp_token_${Date.now()}_${Math.random().toString(36).substr(2, 16)}`;
 			
-			// Store token mapping (in production, use a database with expiration)
-			const tokenData = {
-				access_token: accessToken,
-				user_info: userInfo,
-				client_id: clientId,
-				scope: "openid profile email",
-				expires_at: Date.now() + (3600 * 1000) // 1 hour
-			};
+			// Store token mapping for later verification
+			tokenStore.set(accessToken, tokenData);
 
 			return new Response(
 				JSON.stringify({
@@ -175,7 +181,6 @@ export default {
 		const clientId = url.searchParams.get("client_id");
 		const redirectUri = url.searchParams.get("redirect_uri");
 		const state = url.searchParams.get("state");
-		const scopes = url.searchParams.get("scope") || "openid email profile";
 		const codeChallenge = url.searchParams.get("code_challenge");
 		const codeChallengeMethod = url.searchParams.get("code_challenge_method");
 
@@ -183,31 +188,35 @@ export default {
 			return new Response("Missing required parameters", { status: 400 });
 		}
 
-		// Verify client is registered
-		const client = registeredClients.get(clientId);
-		if (!client) {
-			return new Response("Invalid client", { status: 401 });
-		}
+		// Calculate the actual redirect URI we'll use
+		const actualRedirectUri = `${url.origin}/callback`;
+		console.log("=== OAuth Debug Info ===");
+		console.log("Request origin:", url.origin);
+		console.log("Actual redirect URI:", actualRedirectUri);
+		console.log("Google Client ID:", env.GOOGLE_CLIENT_ID);
 
-		// Construct Cognito authorization URL
-		const cognitoAuthUrl = new URL("https://zimitechs-gen2.auth.us-west-2.amazoncognito.com/oauth2/authorize");
-		cognitoAuthUrl.searchParams.set("client_id", env.COGNITO_CLIENT_ID);
-		cognitoAuthUrl.searchParams.set("response_type", "code");
-		cognitoAuthUrl.searchParams.set("scope", scopes);
-		cognitoAuthUrl.searchParams.set("redirect_uri", `${url.origin}/callback`);
+		// Construct Google OAuth URL (DIRECT TO GOOGLE)
+		const googleAuthUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+		googleAuthUrl.searchParams.set("client_id", env.GOOGLE_CLIENT_ID);
+		googleAuthUrl.searchParams.set("response_type", "code");
+		googleAuthUrl.searchParams.set("scope", "openid email profile");
+		googleAuthUrl.searchParams.set("redirect_uri", actualRedirectUri);
 		
-		// Include original state and redirect info in Cognito state
-		const cognitoState = JSON.stringify({
-			originalState: state,
-			originalRedirectUri: redirectUri,
-			originalClientId: clientId,
+		// Store original MCP client info in state
+		const googleState = JSON.stringify({
+			mcpClientId: clientId,
+			mcpRedirectUri: redirectUri,
+			mcpState: state,
 			codeChallenge,
 			codeChallengeMethod
 		});
-		cognitoAuthUrl.searchParams.set("state", cognitoState);
+		googleAuthUrl.searchParams.set("state", googleState);
 
-		// Redirect to Cognito
-		return Response.redirect(cognitoAuthUrl.toString(), 302);
+		console.log("Final Google Auth URL:", googleAuthUrl.toString());
+		console.log("========================");
+
+		// Redirect directly to Google
+		return Response.redirect(googleAuthUrl.toString(), 302);
 	},
 
 	async handleCallback(request: Request, env: any): Promise<Response> {
@@ -216,49 +225,77 @@ export default {
 		const state = url.searchParams.get("state");
 		const error = url.searchParams.get("error");
 
+		console.log("=== OAuth Callback Debug ===");
+		console.log("Callback URL:", url.toString());
+		console.log("Has code:", !!code);
+		console.log("Has state:", !!state);
+		console.log("Has error:", !!error);
+
 		if (error) {
-			return new Response(`OAuth error: ${error}`, { status: 400 });
+			console.error("Google OAuth error:", error);
+			return new Response(`Google OAuth error: ${error}`, { status: 400 });
 		}
 
 		if (!code || !state) {
+			console.error("Missing authorization code or state");
 			return new Response("Missing authorization code or state", { status: 400 });
 		}
 
 		try {
-			// Parse the state to get original redirect info
+			// Parse the state to get original MCP client info
 			const stateData = JSON.parse(state);
-			const { originalRedirectUri, originalClientId, originalState } = stateData;
+			const { mcpClientId, mcpRedirectUri, mcpState } = stateData;
+			console.log("Parsed state data:", { mcpClientId, mcpRedirectUri, mcpState });
 
-			// Exchange code for tokens
-			const tokenResponse = await this.exchangeCodeForTokens(code, url.origin, env);
+			// Exchange code for Google tokens
+			console.log("Exchanging code for Google tokens...");
+			const googleTokens = await this.exchangeGoogleCodeForTokens(code, url.origin, env);
+			console.log("Google tokens received, has id_token:", !!googleTokens.id_token);
 			
-			// Get user info
-			const userInfo = await this.getUserInfo(tokenResponse.access_token, env);
+			// Get user info from Google
+			console.log("Getting Google user info...");
+			const googleUserInfo = await this.getGoogleUserInfo(googleTokens.access_token);
+			console.log("Google user info:", { sub: googleUserInfo.sub, email: googleUserInfo.email });
 
-			// Create the final authorization code for the MCP client
-			const finalAuthCode = await this.createMCPAuthCode(userInfo, env);
+			// Get Cognito Identity ID using Google token
+			console.log("Getting Cognito Identity ID...");
+			const cognitoIdentityId = await this.getCognitoIdentityId(googleTokens.id_token!, env);
+			console.log("Cognito Identity ID received:", cognitoIdentityId);
 
-			// Redirect back to the original client
-			const finalRedirectUrl = new URL(originalRedirectUri);
-			finalRedirectUrl.searchParams.set("code", finalAuthCode);
-			if (originalState) {
-				finalRedirectUrl.searchParams.set("state", originalState);
+			// Create MCP auth code containing all user data
+			const mcpAuthCode = await this.createMCPAuthCode({
+				cognitoIdentityId,
+				googleUserId: googleUserInfo.sub,
+				email: googleUserInfo.email!,
+				name: googleUserInfo.name || googleUserInfo.given_name || googleUserInfo.email!,
+			});
+			console.log("MCP auth code created, length:", mcpAuthCode.length);
+
+			// Redirect back to the MCP client
+			const finalRedirectUrl = new URL(mcpRedirectUri);
+			finalRedirectUrl.searchParams.set("code", mcpAuthCode);
+			if (mcpState) {
+				finalRedirectUrl.searchParams.set("state", mcpState);
 			}
+
+			console.log("Redirecting to MCP client:", finalRedirectUrl.toString());
+			console.log("============================");
 
 			return Response.redirect(finalRedirectUrl.toString(), 302);
 		} catch (error) {
 			console.error("OAuth callback error:", error);
-			return new Response("OAuth callback failed", { status: 500 });
+			console.error("Error stack:", error instanceof Error ? error.stack : 'No stack');
+			return new Response(`OAuth callback failed: ${error}`, { status: 500 });
 		}
 	},
 
-	async exchangeCodeForTokens(code: string, origin: string, env: any): Promise<CognitoTokenResponse> {
-		const tokenUrl = "https://zimitechs-gen2.auth.us-west-2.amazoncognito.com/oauth2/token";
+	async exchangeGoogleCodeForTokens(code: string, origin: string, env: any): Promise<GoogleTokenResponse> {
+		const tokenUrl = "https://oauth2.googleapis.com/token";
 		
 		const params = new URLSearchParams({
 			grant_type: "authorization_code",
-			client_id: env.COGNITO_CLIENT_ID,
-			client_secret: env.COGNITO_CLIENT_SECRET,
+			client_id: env.GOOGLE_CLIENT_ID,
+			client_secret: env.GOOGLE_CLIENT_SECRET,
 			code: code,
 			redirect_uri: `${origin}/callback`,
 		});
@@ -273,14 +310,14 @@ export default {
 
 		if (!response.ok) {
 			const errorText = await response.text();
-			throw new Error(`Token exchange failed: ${response.status} ${errorText}`);
+			throw new Error(`Google token exchange failed: ${response.status} ${errorText}`);
 		}
 
 		return await response.json();
 	},
 
-	async getUserInfo(accessToken: string, env: any): Promise<CognitoUserInfo> {
-		const userInfoUrl = "https://zimitechs-gen2.auth.us-west-2.amazoncognito.com/oauth2/userInfo";
+	async getGoogleUserInfo(accessToken: string): Promise<GoogleUserInfo> {
+		const userInfoUrl = "https://www.googleapis.com/oauth2/v2/userinfo";
 		
 		const response = await fetch(userInfoUrl, {
 			headers: {
@@ -289,24 +326,74 @@ export default {
 		});
 
 		if (!response.ok) {
-			throw new Error(`User info request failed: ${response.status}`);
+			throw new Error(`Google user info request failed: ${response.status}`);
 		}
 
 		return await response.json();
 	},
 
-	async createMCPAuthCode(userInfo: CognitoUserInfo, env: any): Promise<string> {
-		// Create a simple auth code containing user info
-		// In production, you might want to store this in a database and return a reference
-		const authData = {
-			sub: userInfo.sub,
-			email: userInfo.email,
-			name: userInfo.name || userInfo.given_name || userInfo.email,
+	async getCognitoIdentityId(googleIdToken: string, env: any): Promise<string> {
+		console.log("=== Getting Cognito Identity ID ===");
+		console.log("Identity Pool ID:", env.COGNITO_IDENTITY_POOL_ID);
+		console.log("AWS Region:", env.AWS_REGION);
+		console.log("Google ID Token length:", googleIdToken.length);
+
+		try {
+			// Call AWS Cognito Identity Pool using REST API
+			const identityUrl = `https://cognito-identity.${env.AWS_REGION}.amazonaws.com/`;
+			
+			const getIdRequest = {
+				IdentityPoolId: env.COGNITO_IDENTITY_POOL_ID,
+				Logins: {
+					"accounts.google.com": googleIdToken
+				}
+			};
+
+			console.log("Calling Cognito GetId API...");
+			const response = await fetch(identityUrl, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-amz-json-1.1',
+					'X-Amz-Target': 'AWSCognitoIdentityService.GetId'
+				},
+				body: JSON.stringify(getIdRequest)
+			});
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				console.error("Cognito GetId failed:", response.status, errorText);
+				throw new Error(`Cognito GetId failed: ${response.status} ${errorText}`);
+			}
+
+			const result = await response.json() as CognitoIdentityResponse;
+			console.log("Cognito GetId result:", result);
+
+			if (!result.IdentityId) {
+				throw new Error("Failed to get Cognito Identity ID from response");
+			}
+
+			console.log("Successfully got Cognito Identity ID:", result.IdentityId);
+			return result.IdentityId;
+		} catch (error) {
+			console.error("Failed to get Cognito Identity ID:", error);
+			console.error("Error details:", error instanceof Error ? error.stack : 'No stack');
+			throw error;
+		}
+	},
+
+	async createMCPAuthCode(tokenData: CreateMCPAuthCodeInput): Promise<string> {
+		// Add timestamp for token validation
+		const authData: MCPTokenData = {
+			...tokenData,
 			timestamp: Date.now(),
 		};
 		
-		// Simple base64 encoding for demo purposes
-		// In production, consider using JWT or storing in a database
+		// Base64 encode the token data
 		return btoa(JSON.stringify(authData));
 	},
+
+	// Helper function to verify MCP tokens
+	verifyMCPToken(accessToken: string): MCPTokenData | null {
+		return tokenStore.get(accessToken) || null;
+	}
 }; 

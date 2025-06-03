@@ -1,7 +1,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import CognitoHandler from "./cognito-handler";
+import { cognitoHandler } from "./cognito-handler";
 
 // Define our MCP agent with tools
 export class MyMCP extends McpAgent {
@@ -57,7 +57,7 @@ export class MyMCP extends McpAgent {
 			}
 		);
 
-		// Add todo tool that calls external API
+		// Add todo tool with user authentication and data isolation
 		this.server.tool(
 			"add_todo",
 			{
@@ -66,6 +66,20 @@ export class MyMCP extends McpAgent {
 			},
 			async ({ title, note }) => {
 				try {
+					// Get user info from execution context (set by middleware)
+					const userInfo = (this as any).executionContext?.userInfo;
+					
+					if (!userInfo) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: "Error: Authentication required. Please log in first.",
+								},
+							],
+						};
+					}
+
 					// Generate current date and time
 					const now = new Date();
 					
@@ -87,14 +101,19 @@ export class MyMCP extends McpAgent {
 						hour12: true
 					});
 
-					// Prepare request body
+					// Prepare request body with user identity
 					const requestBody = {
 						title,
 						note: note || "",
 						date,
 						startTime,
-						endTime
+						endTime,
+						// Add user identity for data isolation
+						userId: userInfo.cognitoIdentityId,
+						userEmail: userInfo.email
 					};
+
+					console.log(`Creating todo for user: ${userInfo.cognitoIdentityId} (${userInfo.email})`);
 
 					// Call the external API
 					const response = await fetch("https://2s627cz5fiowa22mehsoxahboq0pibpv.lambda-url.us-west-2.on.aws/tasks", {
@@ -121,7 +140,7 @@ export class MyMCP extends McpAgent {
 						content: [
 							{
 								type: "text",
-								text: `Todo created successfully! Response: ${result}`,
+								text: `Todo created successfully for ${userInfo.name}! Response: ${result}`,
 							},
 						],
 					};
@@ -140,43 +159,53 @@ export class MyMCP extends McpAgent {
 	}
 }
 
-// OAuth middleware to check for bearer token
-async function requireAuth(request: Request, env: Env): Promise<Response | null> {
+// Enhanced OAuth middleware with proper token verification
+async function requireAuth(request: Request, env: Env, ctx: ExecutionContext): Promise<{ error: Response | null, userInfo: any }> {
 	const authHeader = request.headers.get("Authorization");
 	
 	if (!authHeader || !authHeader.startsWith("Bearer ")) {
-		return new Response(
-			JSON.stringify({
-				error: "unauthorized",
-				message: "Bearer token required for MCP access"
-			}),
-			{
-				status: 401,
-				headers: {
-					"Content-Type": "application/json",
-					"WWW-Authenticate": "Bearer"
+		return {
+			error: new Response(
+				JSON.stringify({
+					error: "unauthorized",
+					message: "Bearer token required for MCP access. Please authenticate first.",
+					auth_url: `${new URL(request.url).origin}/authorize`
+				}),
+				{
+					status: 401,
+					headers: {
+						"Content-Type": "application/json",
+						"WWW-Authenticate": "Bearer"
+					}
 				}
-			}
-		);
+			),
+			userInfo: null
+		};
 	}
 
-	// Here you would typically validate the token
-	// For now, we'll just check if it exists
 	const token = authHeader.substring(7);
-	if (!token) {
-		return new Response(
-			JSON.stringify({
-				error: "invalid_token",
-				message: "Invalid bearer token"
-			}),
-			{
-				status: 401,
-				headers: { "Content-Type": "application/json" }
-			}
-		);
+	const userInfo = cognitoHandler.verifyMCPToken(token);
+	
+	if (!userInfo) {
+		return {
+			error: new Response(
+				JSON.stringify({
+					error: "invalid_token",
+					message: "Invalid or expired authentication token"
+				}),
+				{
+					status: 401,
+					headers: { "Content-Type": "application/json" }
+				}
+			),
+			userInfo: null
+		};
 	}
 
-	return null; // Authentication passed
+	// Store user info in execution context for tools to access
+	(ctx as any).userInfo = userInfo;
+
+	return { error: null, userInfo };
 }
 
 export default {
@@ -206,19 +235,20 @@ export default {
 
 		// Handle OAuth authorization endpoint
 		if (url.pathname === "/authorize" || url.pathname === "/callback" || url.pathname === "/token" || url.pathname === "/register") {
-			return CognitoHandler.fetch(request, env);
+			return cognitoHandler.fetch(request, env);
 		}
 
 		// Protect MCP endpoints with authentication
 		if (url.pathname === "/sse" || url.pathname === "/sse/message") {
-			const authError = await requireAuth(request, env);
+			const { error: authError, userInfo } = await requireAuth(request, env, ctx);
 			if (authError) return authError;
 			
+			// Pass execution context with user info to MCP agent
 			return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
 		}
 
 		if (url.pathname === "/mcp") {
-			const authError = await requireAuth(request, env);
+			const { error: authError, userInfo } = await requireAuth(request, env, ctx);
 			if (authError) return authError;
 			
 			return MyMCP.serve("/mcp").fetch(request, env, ctx);
